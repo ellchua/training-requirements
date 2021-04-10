@@ -1,0 +1,186 @@
+---
+title: "ChIPseq Analysis of STAT6 and TP53"
+author: "Ellora Chua"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup}
+short=FALSE #need short == FALSE for code_folding to work
+debug=FALSE
+knitr::opts_knit$set(root.dir = "~/Desktop/BRN_training")
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='figures/ChIPseq/',
+                      echo=!short, warning=debug, message=debug, dev=c("png", "pdf"))
+```
+
+```{r}
+library(rtracklayer)
+library(tidyverse)
+library(GenomicFeatures)
+library(GenomicRanges)
+library(enrichplot)
+library(clusterProfiler)
+library(ChIPpeakAnno)
+library(ChIPseeker)
+library(knitr)
+library(ggpubr)
+library(DT)
+library(genomation)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+library(png)
+library(ReactomePA)
+```
+
+This document is a ChIPseq analysis of [TP53](https://www.encodeproject.org/experiments/ENCSR980EGJ/) and [STAT6](https://www.encodeproject.org/experiments/ENCSR228ZYW/). The ChIP peaks used were GRCh38 IDR thresholded peaks obtained from [ENCODE](https://www.encodeproject.org/), specifically [here](https://www.encodeproject.org/files/ENCFF849LSO/) for TP53 and [here](https://www.encodeproject.org/files/ENCFF861MUF/) for STAT6. The purpose of this analysis is to simply explore the relationship (if any) between these two transcription factors by unconvering potential shared gene targets or enriched pathways. 
+
+## Analysing peaks
+
+The ChIP peaks were analysed using two R packages, namely [ChIPseeker](https://www.bioconductor.org/packages/release/bioc/vignettes/ChIPseeker/inst/doc/ChIPseeker.html) and [ChIPpeakAnno](https://www.bioconductor.org/packages/release/bioc/html/ChIPpeakAnno.html). 
+
+First, overlapping peaks were calculated between between the two samples using the `ChIPpeakAnno` R package. There are a large number of peaks that are exclusive to each transcription factor, but there is an overlap of 2644 peaks **(Fig. 1A)**. The read count frequency of the peaks are then visualised by plotting the peaks based on the average distance from each annotated TSS using `ChIPseeker` **(Fig. 1B)**. Using a window of +/- 1500bp around the TSS of genes, the density of read count frequency is plotted to see where binding is relative to the TSS for each sample **(Fig. 1C)**. While both samples have high amount of signal at the TSS, TP53 appears to have a slightly higher amount of signal than STAT6. Finally, the percentage of peak alignment with various genomic features (such as intron, exon, 3’UTR, etc.) was calculated for each condition **(Fig. 1D)**. TP53 has a higher percentage of peaks overlapping with the promoter region than STAT6 , which aligns with what was observed in **Fig. 1C**.
+
+```{r}
+stat6_peaks <- unique(readGeneric("STAT6.bed", keep.all.metadata = TRUE))
+tp53_peaks <- unique(readGeneric("TP53.bed", keep.all.metadata = TRUE))
+```
+
+```{r, results='hide'}
+olaps <- findOverlapsOfPeaks(stat6_peaks, tp53_peaks)
+makeVennDiagram(olaps, NameOfPeaks = c("STAT6", "TP53"), fill=c("#c1e7ff", "#9c4300"), # circle fill color
+                col=c("#7aa6c2", "#703102"), #circle border color
+                cat.col=c("#7aa6c2", "#703102"), # label color, keep same as circle border color
+                cat.cex=3,
+                cex = 4,
+                cat.pos = c(0,0),
+                plot = FALSE)
+```
+
+```{r}
+promoter <- getPromoters(TxDb=txdb, upstream=1500, downstream=1500)
+stat6_tagMatrix <- getTagMatrix(stat6_peaks, windows=promoter)
+tp53_tagMatrix <- getTagMatrix(tp53_peaks, windows=promoter)
+```
+
+```{r, results='hide', fig.show='hide'}
+p2 <- tagHeatmap(list(STAT6 = stat6_tagMatrix, TP53 = tp53_tagMatrix), xlim=c(-1500, 1500), color=NULL)
+p3 <- plotAvgProf(list(STAT6 = stat6_tagMatrix, TP53 = tp53_tagMatrix), xlim=c(-1500, 1500),
+            xlab="Genomic Region (5'->3')", ylab = "Read Count Frequency")
+```
+
+```{r annotate peaks, results='hide'}
+stat6_anno_peaks <- annotatePeak(stat6_peaks, tssRegion=c(-1500, 1500),
+                         TxDb=txdb, annoDb="org.Hs.eg.db") 
+stat6_df <- stat6_anno_peaks %>%
+  as.data.frame() %>%
+  mutate(TF = rep("STAT6", n()))
+
+tp53_anno_peaks <- annotatePeak(tp53_peaks, tssRegion=c(-1500, 1500),
+                         TxDb=txdb, annoDb="org.Hs.eg.db")
+
+tp53_df <- tp53_anno_peaks %>%
+  data.frame() %>%
+  mutate(TF = rep("TP53", n()))
+
+merged_peaks <- olaps$mergedPeaks
+
+stat6_tp53_anno_peaks <- annotatePeak(merged_peaks, tssRegion=c(-1500, 1500),
+                         TxDb=txdb, annoDb="org.Hs.eg.db")
+```
+
+```{r}
+p4 <- rbind(stat6_df, tp53_df) %>%
+  mutate(annotation = gsub("\\([^()]*\\)", "", annotation)) %>%
+  dplyr::count(TF, annotation) %>%
+  group_by(TF) %>%
+  mutate(Total= sum(n)) %>%
+  mutate(per=as.numeric(round(100*n/Total,2))) %>%
+  ggplot(aes(annotation, per, fill=TF)) + geom_col(position=position_dodge(width=1), stat="identity") + xlab(NULL) +
+  geom_text(aes(label=per, vjust=-0.5),stat="identity",position=position_dodge(1), size=2.5) + ylab("Percent peaks overlapping (%)") + scale_fill_manual(values=c("#c1e7ff", "#9c4300")) + theme(axis.text.x = element_text(angle=45, vjust=1, hjust = 1))
+
+```
+
+```{r}
+venn_png <- readPNG("venn_diagram.png")
+p1 <- rasterGrob(venn_png, interpolate=TRUE)
+
+prom_png <- readPNG("figures/ChIPseq/unnamed-chunk-5-1.png")
+p2 <- rasterGrob(prom_png, interpolate=TRUE)
+```
+
+```{r, fig.height=10}
+ggarrange(plotlist = list(p1, p2, p3, p4), nrow = 2, ncol = 2, labels = c("1A", "1B", "1C", "1D"))
+
+```
+
+## Datatable of Annotated Peaks {.tabset}
+
+### STAT6 Annotated Peaks
+```{r}
+stat6_anno_peaks %>%
+  data.frame() %>%
+  rename(peakScore = V5) %>%
+  select(peakScore, geneChr, geneStart, geneEnd, geneLength, geneStrand, geneId, transcriptId, distanceToTSS, annotation, ENSEMBL, SYMBOL, GENENAME) %>%
+  datatable(options = list(scrollX = TRUE, scrollY=TRUE), caption = "Table 1: STAT6 Annotated Peaks", class = "nowrap display")
+```
+
+### TP53 Annotated Peaks
+```{r}
+tp53_anno_peaks %>%
+  data.frame() %>%
+  rename(peakScore = V5) %>%
+  select(peakScore, geneChr, geneStart, geneEnd, geneLength, geneStrand, geneId, transcriptId, distanceToTSS, annotation, ENSEMBL, SYMBOL, GENENAME) %>%
+  datatable(options = list(scrollX = TRUE, scrollY=TRUE), caption = "Table 2: TP53 Annotated Peaks", class = "nowrap display")
+```
+
+### STAT6 and P53 Annotated Overlapping Peaks
+```{r}
+stat6_tp53_anno_peaks %>%
+  data.frame() %>%
+  select(geneChr, geneStart, geneEnd, geneLength, geneStrand, geneId, transcriptId, distanceToTSS, annotation, ENSEMBL, SYMBOL, GENENAME, peakNames) %>%
+  datatable(options = list(scrollX = TRUE, scrollY=TRUE), caption = "Table 3: STAT6 and TP53 Annotated Overlapping Peaks", class = "nowrap display")
+```
+
+## Pathway enrichment analysis {.tabset}
+
+The nearest genes to the TSS were annotated with `ChIPseeker` and pathway enrichment analysis was carried out on these genes. The pathway enrichment analysis helps in identifying predominant biological themes among these genes by incorporating knowledge provided by biological ontologies. 
+
+Many of the 20 pathways shown are shared between STAT6 and TP53 and only a handful of pathways are unique to each STAT6 and TP53. The top few pathways highlight that TP53 and STAT6 binding affect translation as well as various cell cyle processes. Some other common pathways include apoptosis and deubiquitination, alluding to the roles of STAT6 and TP53 in cell proliferation, apoptosis and differentiation. STAT6 however seems to be involved in a wider range of processes than TP53 - pathways such as HIV Infection, Regulation of cholesterol biosynthesis by SREBPs, and Cellular response to hypoxia - are only unique to STAT6. 
+
+STAT6 belongs to the family of the signal transducer and activator of transcription proteins whereas TP53 encodes the tumour supressor protein, p53. Given this context, it makes sense that many of these pathways overlap. STAT6 plays a role in signalling and activating gene expression while p53 regulates cell division by keeping cells from proliferating too fast or in an uncontrolled way via the MAPK pathway **(Table 5)**. Interestingly, certain gene targets of STAT6 are also implicated in "Oncogenic MAPK signaling" **(Table 4)**. 
+
+STAT6 and TP53 have many pathway processes in common, and how TP53 and STAT6 binding (or lack thereof) affect the MAPK pathway could be one of the potential questions to ask. Experiments could be done to further investigate the direct or indirect interactions of TP53 and STAT6. For example, knocking down either TP53 or STAT6 and looking at how this affects the genes associated with the MAPK pathway via RNAseq or eQTL etc. could potentially shed some light on the relationship between TP53 and STAT6. 
+
+
+```{r annotation_data}
+genes = lapply(list(STAT6=stat6_anno_peaks, TP53=tp53_anno_peaks), function(i) {as.data.frame(i)$geneId})
+names(genes) = sub("_", "\n", names(genes))
+compPathway <- compareCluster(geneCluster   = genes,
+                         fun           = "enrichPathway",
+                         pvalueCutoff  = 0.05,
+                         pAdjustMethod = "BH")
+dotplot(compPathway, showCategory = 20, title = "Pathway Enrichment Analysis") + theme(axis.text.y = element_text(size=10))
+
+res <- compPathway@compareClusterResult
+```
+
+### STAT6
+```{r}
+datatable(res[res$Cluster == "STAT6",], options = list(scrollX = 800, 
+                                                           scrollY = TRUE),
+          caption = "Table 4: Enriched Pathways for STAT6",
+          class = "nowrap display")
+```
+
+### TP53
+```{r}
+datatable(res[res$Cluster == "TP53",], options = list(scrollX = 800, 
+                                                           scrollY = TRUE),
+          caption = "Table 5: Enriched Pathways for TP53",
+          class = "nowrap display")
+```
+
+##
