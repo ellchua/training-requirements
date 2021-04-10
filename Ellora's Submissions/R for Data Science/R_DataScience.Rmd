@@ -1,0 +1,304 @@
+---
+title: "Analysing Gapminder"
+author: "Ellora Chua"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup}
+short=FALSE #need short=FALSE for code_folding to work
+debug=FALSE
+knitr::opts_knit$set(root.dir = "~/Desktop/BRN_training")
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='figures/gapminder/',
+                      echo=!short, warning=debug, message=debug, dev=c("png", "pdf"))
+```
+
+```{r load libraries}
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(knitr)
+library(ggalt)
+library(multcompView)
+library(grid)
+library(gridExtra)
+```
+
+```{r read data}
+gapminder <- read.csv("gapminder_clean.csv", header = TRUE)
+gapminder <- gapminder %>% select(-X)
+```
+
+## Gapminder Data from 1962
+```{r}
+gapminder_1962 <- gapminder %>%
+  filter(Year == 1962) 
+
+datatable(gapminder_1962, options = list(scrollX = TRUE,
+                           scrollY = TRUE))
+```
+
+## Scatter plot comparing CO2 emissions & GDP per capita of 1962 {.tabset}
+Here we're trying to analyse the relationship between CO2 emissions and GDP per capita. Plotting `gdpPercap` against `CO2.emissions..metric.tons.per.capita.` shows that the data points are closely clustered around the bottom left corner of the plot. So we also plot it on a **log scale** to better show the relationship between the two variables. 
+
+### Without Log Scale
+
+```{r}
+gapminder_1962 %>%
+  ggplot(aes(x = CO2.emissions..metric.tons.per.capita., y = gdpPercap)) +
+  geom_point() +
+  labs(title="CO2 emissions (metric tons per capita) vs GDP per capita in 1962")
+```
+
+### With Log Scale
+
+```{r}
+gapminder_1962 %>%
+  ggplot(aes(x = CO2.emissions..metric.tons.per.capita., y = gdpPercap)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title="CO2 emissions (metric tons per capita) vs GDP per capita in 1962 (log scale)") +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+## Correlation, p-value of CO2 emissions & GDP per capita (1962)
+I first log transformed CO2 emissions and gdpPercap and assigned them to new variables. I then summarized correlations by running `cor.test` on the two log-transformed variables, and extracted the correlation estimates and p-value.
+```{r}
+gapminder_cor <- gapminder_1962 %>%
+  filter(!is.na(CO2.emissions..metric.tons.per.capita.) & !is.na(gdpPercap)) %>%
+   mutate(log_co2 = log(CO2.emissions..metric.tons.per.capita.),
+          log_gdp = log(gdpPercap)) %>%
+   summarize(correlation = cor.test(log_co2, log_gdp, method = "pearson")$estimate,
+             p.value = cor.test(log_co2, log_gdp, method = "pearson")$p.value)
+
+kable(gapminder_cor, digits = 100, align = "cc")
+```
+So here we see that there's a correlation coefficient of `r gapminder_cor$correlation` and a p-value of `r gapminder_cor$p.value`.
+
+## Correlation, p-value of CO2 emissions & GDP per capita (all) {.tabset}
+This step was pretty similar to the step above. The only differences were:
+
+1. After log-transforming the data, I grouped the data by Year. 
+2. After obtaining the correlation estimates and p-value, I arranged it by descending order of correlation to get the Year with the highest correlation. 
+
+```{r}
+gapminder_cor <- gapminder %>%
+  filter(!is.na(CO2.emissions..metric.tons.per.capita.) & !is.na(gdpPercap)) %>%
+   mutate(log_co2 = log(CO2.emissions..metric.tons.per.capita.),
+          log_gdp = log(gdpPercap)) %>%
+   group_by(Year) %>%
+   summarize(correlation = cor.test(log_co2, log_gdp, method = "pearson")$estimate,
+             p.value = cor.test(log_co2, log_gdp, method = "pearson")$p.value) %>%
+   arrange(desc(correlation))
+
+kable(gapminder_cor, digits = 100, align = "ccc")
+```
+
+## Year with strongest correlation 
+As established above, the year with the strongest correlation is 2002. Filtering out for the year 2002 and plotting a scatter plot to see the correlation between CO2 emissions and GDP per capita, we get this: 
+
+```{r}
+gapminder_2002 <- gapminder %>% 
+  filter(Year == 2002)
+```
+
+```{r}
+p <- gapminder_2002 %>% 
+  na.omit() %>% ggplot(aes(CO2.emissions..metric.tons.per.capita.,gdpPercap, size = pop, color = continent)) + geom_point() + scale_x_log10() + scale_y_log10() + labs(title="CO2 emissions vs GDP per capita in 2002") +
+  xlab("log CO2 emissions (metric tons per capita)") + ylab("log GDP per capita") +
+  guides(color = guide_legend(order=2),
+         size = guide_legend(order=1))
+
+ggplotly(p, width = 800, height = 500)
+```
+
+It appears that `ggplotly()` isn't able to handle two legends, and has combined both population and continent legends. 
+
+## Relationship between continent and energy use
+First let's visualise the energy use of each continent using a boxplot:
+
+```{r}
+p <- gapminder %>%
+  na.omit() %>%
+  ggplot(aes(continent, Energy.use..kg.of.oil.equivalent.per.capita.)) + geom_boxplot() + scale_y_log10() +
+  labs(title="Relationship between Continents and Energy Use") + ylab("log Energy Use (kg of oil equivalent per capita)") + xlab("Continents")
+
+ggplotly(p, width = 800, height = 500)
+```
+
+There seems to be a difference between continents and their energy use, but the next thing would be to determine if there is any significant difference between the average energy use in the 5 continents. We use a **one-way ANOVA** to determine this:
+```{r}
+energy.use <- gapminder %>%
+  filter(!is.na(Energy.use..kg.of.oil.equivalent.per.capita.) & continent != "")
+
+one.way <- aov(Energy.use..kg.of.oil.equivalent.per.capita. ~ continent, data = energy.use)
+
+summary(one.way)
+```
+The p-value of the continent variable is low (***: p < 0), so there is indeed a significant difference between continents and their energy use. The ANOVA test returns a significant p-value that indicates that some of the group means are different, however, there is no information on which pairs of groups are actually different. So to determine if the mean difference between specific pairs of groups are statistically different, a multiple pairwise-comparison is performed using Tukey HSD (Tukey Honest Significant Differences). 
+
+```{r, fig.width=8}
+tukey <- TukeyHSD(one.way)
+tukey_table <- tukey$continent %>%
+  data.frame() %>%
+  rownames_to_column(var = "Comparisons")
+
+p <- ggplot(tukey_table, aes(Comparisons, diff)) + geom_point(aes(text = paste(
+        "Difference in mean:", signif(diff,5),
+        "\nUpper CI:", signif(upr,5),
+        "\nLower CI:", signif(lwr,5)))) +
+  geom_errorbar(aes(ymin=lwr, ymax=upr), width=.2,
+                 position=position_dodge(0.05)) + 
+  geom_hline(yintercept=0, linetype="dashed", 
+                color = "red", size=1) + ylab("Differences in mean") + theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1)) +
+  labs(title = "Relationship between Continents and Energy Use")
+
+ggplotly(p, tooltip = "text")
+```
+The significant groupwise differences are those where the 95% confidence interval doesn’t include zero. Here we see that the lower end point of the confidence interval for Asia and Americas as well as Oceania and Europe crosses over to 0 (the red line). Therefore, the average energy use between Asia and Americas as well as between Oceania and Europe are not statistically significant. The energy use between all other continents, however, are statistically different.
+
+## Difference between Imports in Europe vs Asia
+
+The question is: is there a significant difference between Europe and Asia with respect to 'Imports of goods and services (% of GDP)' in the years after 1990? 
+
+### Is there a difference?
+Again, let's first visualise this:
+
+```{r}
+gapminder_import <- gapminder %>%
+  na.omit() %>%
+  filter(continent == "Europe" | continent == "Asia") %>%
+  filter(Year > 1990) %>%
+  group_by(continent, Year)
+
+ggplotly(ggplot(gapminder_import, aes(as.factor(Year), Imports.of.goods.and.services....of.GDP., fill=continent)) + geom_boxplot(width=.15) + labs(title="Imports of goods and services in Europe and Asia from 1992-2007") + ylab("Imports of Goods and Services (% of GDP)") + xlab("Years")) %>% layout(width = 800, boxmode = "group")
+```
+
+There seems to be some difference between Europe and Asia with respect to `Imports of goods and services (% of GDP)` in the years after 1990, but are these differences significant? 
+
+### Is it significant?
+To determine if these differences are significant, a **2-way ANOVA** is carried out to model imports of goods and services as a function of continent and year.
+
+```{r}
+import <- gapminder %>%
+  filter(!is.na(Imports.of.goods.and.services....of.GDP.) & continent != "") %>%
+  filter(continent == "Europe" | continent == "Asia") %>%
+  filter(Year > 1990) %>%
+  group_by(continent, Year) %>%
+  mutate(Year = as.factor(Year))
+
+two.way <- aov(Imports.of.goods.and.services....of.GDP. ~ continent + Year, data = import)
+
+summary(two.way)
+```
+The p-values of the continent and Year variables are not significant, so there is no significant difference between Europe and Asia in their imports in goods in the years after 1990. We can visualise the pairwise comparison with Tukey HSD (Tukey Honest Significant Differences): 
+
+```{r fig.width=8, fig.height=6}
+tukey <- TukeyHSD(two.way)
+tukey_continent <- tukey$continent %>%
+  data.frame() %>%
+  rownames_to_column(var = "Comparisons")
+tukey_year <- tukey$Year %>%
+  data.frame() %>%
+  rownames_to_column(var = "Comparisons")
+
+p <- ggplot(tukey_continent, aes(Comparisons, diff)) + geom_point(aes(text = paste(
+        "\nUpper CI:", signif(upr,5),
+        "\nLower CI:", signif(lwr,5)))) +
+  geom_errorbar(aes(ymin=lwr, ymax=upr), width=.2,
+                 position=position_dodge(0.05)) + 
+  geom_hline(yintercept=0, linetype="dashed", color = "red", size=1) + ylab("Differences in mean") + theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1))
+
+q <- ggplot(tukey_year, aes(Comparisons, diff)) + geom_point(aes(text = paste(
+        "\nUpper CI:", signif(upr,5),
+        "\nLower CI:", signif(lwr,5)))) +
+  geom_errorbar(aes(ymin=lwr, ymax=upr), width=.2,
+                 position=position_dodge(0.05)) + 
+  geom_hline(yintercept=0, linetype="dashed", color = "red", size=1) + ylab("Differences in mean") + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+subplot(p,q, 
+        margin = 0.07,
+        shareY = FALSE, 
+        titleY = TRUE)
+```
+Again, the significant groupwise differences are those where the 95% confidence interval doesn’t include zero. Here we see that the lower end point of the confidence interval for the comparisons between Europe and Asia as well as between all the years crosses over to 0 (the red line). 
+
+> **Answer:** Therefore, the average import of goods between Europe and Asia between all the years after 1990 is not statistically significant. 
+
+## Country with highest population density across all years
+
+What is the country that has the highest population density across all years? (i.e., which country has the highest average ranking in this category across each time point in the dataset?)
+
+First, I filter the data to exclude data points with `NA` in the Population Density variable. Then I group by Year, and arrange the data by Year as well as descending population density to get the country with the highest population. I create a new variable called ranking to rank each country by their row number. This means that the country in Rank 1 (or row 1) has the highest population density in that year. This is what the top 10 looks like so far:
+```{r}
+gapminder_popdens <- gapminder %>%
+  filter(!is.na(Population.density..people.per.sq..km.of.land.area.)) %>%
+  group_by(Year) %>%
+  arrange(Year, desc(Population.density..people.per.sq..km.of.land.area.)) %>%
+  mutate(ranking = row_number())
+
+gapminder_top10 <- gapminder_popdens %>%
+  filter(row_number() <= 10) %>%
+  transform(Country.Name=reorder(Country.Name, -ranking))
+
+ggplotly(ggplot(gapminder_top10, aes(factor(ranking), Country.Name)) + geom_point() + labs(title="Ranking of Population Density from 1962 to 2007") + theme(axis.title.y = element_blank()) + xlab("Ranking") + facet_wrap(~ Year)) %>% layout(width = 800)
+```
+Then I group by country names and summarize their average rankings. Here is the top 10 countries with their average rankings:
+
+```{r}
+top_10 <- gapminder_popdens %>%
+  group_by(Country.Name) %>%
+  summarize(avg_ranking = mean(ranking)) %>%
+  arrange(avg_ranking) %>% 
+  head(10) %>% 
+  transform(Country.Name=reorder(Country.Name, -avg_ranking))
+
+ggplotly(ggplot(top_10, aes(avg_ranking, Country.Name)) + geom_point() + labs(title="Average Ranking of Population Density") + ylab("Country Names") + xlab("Average Ranking"), width = 800, height = 500)
+```
+
+> **Answer:** So this shows us that both **Monaco and Macao SAR, China** have the highest population density across all years.
+
+## Country with greatest increase in life expectancy
+
+Which country has shown the greatest increase in life expectancy since 1962?
+
+I filtered out those with `NA` at `Life.expectancy.at.birth..total..years.` and summarized the data such that only those with data in 1962 and 2007 are included. I chose to do it this way as there were countries that were missing data points (e.g. Bermuda only had life expectancy data for 2002 and 2007). 
+
+I then calculated the differences between life expectancy of the countries in 2007 and 1962 and arranged the differences in life expectancy in descending order. Here's a table showing the top 10 results, and a plot showing the top 20: 
+```{r}
+gapminder_lifeExp <- gapminder %>%
+  filter(!is.na(Life.expectancy.at.birth..total..years.)) %>%
+  group_by(Country.Name) %>%
+  summarize(Year_2007 = Life.expectancy.at.birth..total..years.[which(Year == 2007)],
+         Year_1962 = Life.expectancy.at.birth..total..years.[which(Year == 1962)],
+         lifeExpDiff = Year_2007 - Year_1962) %>%
+  arrange(desc(lifeExpDiff)) %>%
+  transform(Country.Name=reorder(Country.Name, lifeExpDiff))
+
+kable(head(gapminder_lifeExp,10), align = "ccc")
+```
+
+```{r}
+p <- ggplot(head(gapminder_lifeExp,20), aes(Country.Name, lifeExpDiff)) + 
+  geom_point(col="tomato2", size=3) +
+  geom_segment(aes(x=Country.Name, 
+                   xend=Country.Name, 
+                   y=min(lifeExpDiff), 
+                   yend=max(lifeExpDiff)), 
+               linetype="dashed", 
+               size=0.1) +
+  ylab("Difference in Life Expectancy between 2007 and 1962 (Years)") + 
+  xlab("Country") + theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+  labs(title = "Top 20 Countries with Greatest Increase in Life Expectancy") +
+  coord_flip() + theme_classic()
+
+ggplotly(p) %>% layout(width=900)
+
+```
+
+> **Answer:** Therefore, **Maldives** has shown the greatest increase in life expectancy since 1962.
