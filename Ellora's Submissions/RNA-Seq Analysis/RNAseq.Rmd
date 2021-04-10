@@ -1,0 +1,366 @@
+---
+title: "RNAseq Analysis of Glioblastoma with and without EGFRvIII mutation"
+author: "Ellora Chua"
+bibliography: citations.bib
+link-citations: yes
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup}
+short=FALSE #need short == FALSE for code_folding to work
+debug=FALSE
+knitr::opts_knit$set(root.dir = "~/Desktop/BRN_training")
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='figures/RNAseq/',
+                      echo=!short, warning=debug, message=debug, dev=c("png", "pdf"))
+```
+
+```{r}
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyverse)
+library(biomaRt)
+library(GenomicFeatures)
+library(enrichplot)
+library(clusterProfiler)
+library(msigdbr)
+library(EnhancedVolcano)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(ggpubr)
+library(DT)
+library(DOSE)
+```
+
+```{r loading ensembl genes, cache=TRUE}
+hs.gtf.db <- makeTxDbFromGFF("/Users/ellora/Desktop/rnaseq/Homo_sapiens.GRCh38.94.chr.gtf", format="gtf" )
+ensembl.genes = genes(hs.gtf.db)
+human = useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl", mirror = "asia")
+bm.annotations = getBM(attributes=c("ensembl_gene_id", "description", "gene_biotype", "external_gene_name"), mart=human, filters="ensembl_gene_id", values=ensembl.genes$gene_id, uniqueRows=TRUE)
+ensembl.genes$gene_biotype = bm.annotations$gene_biotype[match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$entrezgene_id = bm.annotations$entrezgene_id[match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$external_gene_name = bm.annotations$external_gene_name[match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ensembl.genes$description = bm.annotations$description[match(ensembl.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+```
+
+## Data
+
+The following is an RNAseq analysis of glioblastoma (GBM) with and without EGFRvIII mutations. The dataset used is the [SRP063070 study](https://www.ncbi.nlm.nih.gov/Traces/study/?acc=SRP063070&search=RNA-seq&o=acc_s%3Aa) obtained from [recount2](https://jhubiostatistics.shinyapps.io/recount/). There are a total of 15 samples - 8 are GBM cell lines which have been labelled as "GBM_wt" and 7 are GBM biopsy samples correspondingly labelled as "GBM_mut" **(Table 1)**. 
+
+```{r creating metadata file}
+sra_metadata <- read.delim("SraRunTable.txt", sep=",", header = TRUE)
+
+metadata <- sra_metadata %>%
+  dplyr::select(Run, Cell_Line, Tissue) %>%
+  mutate(condition = ifelse(Tissue == "", "GBM_wt", "GBM_mut")) %>%
+  arrange(condition) %>%
+  column_to_rownames("Run") 
+
+metadata %>%
+  kable(align = ("ccc"), caption = "Table 1: The dataset")
+```
+
+```{r loading in counts}
+load("rse_gene.RData")
+raw_counts <- data.frame(assay(rse_gene))
+
+raw_counts <- raw_counts %>%
+  rownames_to_column(var="rowname") %>%
+  filter(!grepl("_PAR_Y", rowname)) %>%
+  mutate(rowname = sapply(strsplit(rowname,"\\."), function(x){x[[1]][1]})) %>%
+  column_to_rownames("rowname") 
+
+if(all(rownames(metadata) == colnames(raw_counts)) == FALSE){
+  idx = match(rownames(metadata), colnames(raw_counts))
+  raw_counts = raw_counts[,idx]
+}
+```
+
+## Calculation of DEGs using `DESeq2`
+### Quality Control
+After creating a `dds` object, the `rlog` transformation was applied to the counts and a principal component analysis (PCA) was generated to visualise how similar replicates are to each other and whether the samples belonging to different sample groups cluster separately **(Fig. 1A)**. The PCA shows that the sample groups - wild type (GBM_wt) and mutated (GBM_mut) - separate well on PC1, which represents 87.36% of the variance in the data. This is encouraging since it seems that a lot of the variation in gene expression in the dataset can likely be explained by the differences between sample groups. This is echoed by a correlation heatmap of the samples **(Fig. 1B)**.
+
+```{r}
+dds = DESeqDataSetFromMatrix(raw_counts, metadata, ~ condition)
+dds <- estimateSizeFactors(dds)
+```
+
+```{r}
+rld <- rlog(dds, blind=TRUE)
+
+pca_data <- plotPCA(rld, intgroup="condition", returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"), digits=2)
+pca_plot <- ggplot(pca_data, aes(PC1, PC2, color=condition)) + geom_point() +
+  scale_x_continuous(paste0("PC1: ",percentVar[1],"% variance")) +
+  scale_y_continuous(paste0("PC2: ",percentVar[2],"% variance")) + 
+  scale_color_manual(values=c("#ffa600", "#346888")) + coord_fixed() + theme_classic()
+
+cor_heatmap <- rld %>%
+  assay() %>%
+  cor() %>%
+  pheatmap(color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+           annotation = dplyr::select(metadata, condition),
+           annotation_colors = list(condition = c(GBM_mut = "#ffa600", GBM_wt = "#346888")),
+           cluster_rows = TRUE,
+           cluster_cols = T,
+           silent = TRUE,
+           cellwidth = 13,
+           cellheight = 13)
+```
+
+```{r}
+ggarrange(plotlist=list(pca_plot, cor_heatmap[[4]]), 
+          ncol=2, nrow=1, labels = c("1A", "1B"))
+```
+
+### Filtering for low counts
+Differentially Expressed Genes (DEGs) were calculated using the R package `DESeq2`. After creating the `dds` object and estimating size factors, the `DESeq` function was called and the result table was extracted. Plotting the p-values of the results, there seems to be a slight peak close to 1 **(Fig. 2A)**. This spike [could be due to low counts](https://support.bioconductor.org/p/102313/#102665), so the `dds` object was filtered with `filter = apply(counts(dds, normalized=TRUE), 1, function(x){mean(x) >= 10})` before calling `DESeq()` and `results()` again. Filtering for lowly expressed genes seems to have addressed the issue well enough **(Fig. 2B)**.
+
+```{r, fig.height=6}
+dds = dds[row.names(counts(dds)) %in% ensembl.genes$gene_id[as.character(seqnames(ensembl.genes)) != "chrM"],]
+dds = dds[!(row.names(counts(dds)) %in% ensembl.genes$gene_id[ensembl.genes$gene_biotype %in% c("Mt_tRNA", "Mt_rRNA", "rRNA", "snoRNA", "snRNA")]),]
+dds = dds[rowSums(counts(dds)) > 0,]
+
+dds_pre_filt <- DESeq(dds) #only separate when other factors involved... cause then you can account for it
+res_pre_filt <- results(dds_pre_filt, contrast = c("condition", "GBM_mut", "GBM_wt"), test="Wald", alpha=0.05)
+pre_filt <- res_pre_filt %>%
+  data.frame() %>%
+  ggplot(aes(res_pre_filt$pvalue)) + geom_histogram()+ labs(title = "Histogram of p-value before filtering low counts") + xlab("p-value")
+
+# Removing lowly expressed genes, only to be done once at the start of the differential expression step
+filter = apply(counts(dds, normalized=TRUE), 1, function(x){ mean(x) >= 10 })
+dds = dds[filter, ]
+dds <- DESeq(dds) #only separate when other factors involved... cause then you can account for it
+res_all <- results(dds, contrast = c("condition", "GBM_mut", "GBM_wt"), test="Wald", alpha=0.05, independentFiltering = TRUE)
+post_filt <- res_all %>%
+  data.frame() %>%
+  ggplot(aes(res_all$pvalue)) + geom_histogram() + labs(title = "Histogram of p-value after filtering low counts") + xlab("p-value")
+
+ggarrange(plotlist=list(pre_filt, post_filt), ncol=2, nrow=1, labels = c("2A", "2B"))
+
+res_all$gene_id= ensembl.genes$gene_id[match(row.names(res_all), ensembl.genes$gene_id)]
+res_all$gene_biotype= ensembl.genes$gene_biotype[match(row.names(res_all), ensembl.genes$gene_id)]
+res_all$external_gene_name= ensembl.genes$external_gene_name[match(row.names(res_all), ensembl.genes$gene_id)]
+res_all$description = ensembl.genes$description[match(row.names(res_all), ensembl.genes$gene_id)]
+
+res_df <- res_all %>%
+  data.frame()
+```
+
+### Obtaining DEGs
+The correlation between statistical significance ($-Log_{10}P$) and magnitude of change ($Log_2$ fold change) shows a large number of genes that have large fold changes and are also statistically significant **(Fig. 3A)**. These biologically significant genes were seen to be strongly divergent between biological conditions **(Fig. 3B)**. These results indicate that there are significant biological differences between GBM cell lines without EGFRvIII mutation and GBM biopsies with the mutation involving these genes.  
+
+```{r, fig.height=10}
+volcano <- EnhancedVolcano(res_all, lab=res_all$external_gene_name, pCutoff = 1e-50, FCcutoff = 3,
+                x = "log2FoldChange", y = "padj",
+                title = NULL,
+                subtitle = NULL,
+                legendPosition = 'right',
+                legendLabSize = 8)
+
+```
+
+```{r}
+oe_res <-
+  res_df %>%
+  filter(log2FoldChange > 2 & padj < 0.01) %>%
+  filter(!is.na(gene_id) & !is.na(external_gene_name)) %>%
+  arrange(padj)
+
+ue_res <-
+  res_df %>%
+  filter(log2FoldChange < -2 & padj < 0.01) %>%
+  filter(!is.na(gene_id) & !is.na(external_gene_name)) %>%
+  arrange(padj)
+
+top_20 <- rbind(head(oe_res,20), head(ue_res,20))
+```
+
+```{r}
+norm_counts <- counts(dds, normalized=TRUE)
+sig_gene_id <- top_20 %>%
+  pull(gene_id)
+sig_gene_symbol <- top_20 %>% pull(external_gene_name)
+
+sig_norm_counts <- norm_counts[sig_gene_id,]
+rownames(sig_norm_counts) <- sig_gene_symbol
+
+top_20_hmap <- pheatmap(sig_norm_counts,
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         cluster_rows = T, 
+         cluster_cols = F,
+         cutree_rows = 2,
+         show_rownames = T,
+         annotation = dplyr::select(metadata, condition),
+         annotation_colors = list(condition = c(GBM_mut = "#ffa600", GBM_wt = "#346888")),
+         scale = "row",
+         fontsize_row = 8,
+         fontsize_col = 8,
+         angle_col = 45,
+         silent = TRUE,
+         cellheight = 8
+         )
+
+```
+
+```{r, fig.height=12}
+ggarrange(volcano, top_20_hmap[[4]], ncol=1, nrow=2, labels = c("3A", "3B"))
+```
+
+### Datatable of DEGs
+Here is a datatable of the significant (padj < 0.01) DEGs:
+```{r}
+res_all %>%
+  data.frame() %>%
+  filter(padj < 0.01) %>%
+  arrange(padj) %>%
+  datatable(options = list(scrollX = TRUE,
+                           scrollY = TRUE),
+            caption = "Table 2: Significant (padj < 0.01) DEGs")
+
+```
+
+
+## GSEA of DEGs
+Gene set enrichment analysis (GSEA) was performed by ranking the genes with the metric: $-log_{10}(FDR) * sign(log_{2}FoldChange)$ and using all ontology gene sets (category C5) available from MSigDB. Three of the top five pathways shown indicates that the overexpressed genes are enriched in processes related to synapses, whereas the other two are related to immune responses. 
+
+### Signalling
+From the GSEA results, one can hypothesise that EGFRvIII has increased signalling compared to non-mutant EGFR, effectuated by the genes associated with the synapses gene sets. This aligns with studies that show EGFRvIII has sustained signalling due to the deletion of exons 2-7 which confers a growth advantage to GBM, highlighting its role in tumorigenesis [@Greenall2016]. The signalling pathway of EGFRvIII could potentially be inferred by analysing the genes associated with these gene sets, and a potential experiment to further validate this hypothesis is to perhaps carry out a knockdown experiment of one or several genes identified. If KO of gene(s) yields promising results, they could be targets for immunotherapy. 
+
+### Immune Response 
+Since mutated genes are recognised as foreign by the immune system, it makes sense genes overexpressed in GBM biopsies with EGFRvIII mutation are enriched for immune responses. This makes it a suitable target for immunotherapy, potentially targetting any gene or pathway associated with these gene sets. 
+
+```{r, cache=TRUE}
+## obtaining gene sets from msigdb ("C" in category needs to be in CAPS)
+gene_sets <- msigdbr(species = "Homo sapiens", category = "C5")
+gene_sets <- gene_sets %>%
+  dplyr::select(gs_name, gene_symbol)
+
+## 1. rank genes in results
+gsea_prep <- res_df %>%
+  arrange(padj) %>%
+  mutate(padj = case_when(padj == 0 ~ .Machine$double.xmin, TRUE ~ padj)) %>%
+  mutate(gsea_metric = -log10(padj) * sign(log2FoldChange)) %>%
+  filter(!is.na(gsea_metric)) %>%
+  arrange(desc(gsea_metric))
+
+## 2. get vector of gene names with their ranking
+gsea_ranks <- gsea_prep %>% 
+  dplyr::select(external_gene_name, gsea_metric) %>%
+  distinct(external_gene_name, .keep_all = TRUE) %>%
+  deframe()
+```
+
+```{r, cache=TRUE}
+## 3. carry out GSEA
+gsea_res <- GSEA(geneList = gsea_ranks,
+                TERM2GENE = gene_sets)
+```
+
+```{r gsea functions}
+## adapted from enrichPlot for greater control over aesthetics
+gsInfo <- function(object, geneSetID) {
+    geneList <- object@geneList
+
+    if (is.numeric(geneSetID))
+        geneSetID <- object@result[geneSetID, "ID"]
+
+    geneSet <- object@geneSets[[geneSetID]]
+    exponent <- object@params[["exponent"]]
+    df <- gseaScores(geneList, geneSet, exponent, fortify=TRUE)
+    df$ymin <- 0
+    df$ymax <- 0
+    pos <- df$position == 1
+    h <- diff(range(df$runningScore))/20
+    df$ymin[pos] <- -h
+    df$ymax[pos] <- h
+    df$geneList <- geneList
+
+    df$Description <- object@result[geneSetID, "Description"]
+    return(df)
+}
+
+gseaScores <- getFromNamespace("gseaScores", "DOSE")
+
+plot_gsea <- function (x, geneSetID, by = "all", title = "",
+                                 color='black', color.line="green",
+                                 color.vline="#FA5860", ...){
+    by <- match.arg(by, c("runningScore", "preranked", "all"))
+    gsdata <- gsInfo(x, geneSetID)
+    p <- ggplot(gsdata, aes_(x = ~x)) +
+        theme_dose() + xlab("Position in the Ranked List of Genes")
+    if (by == "runningScore" || by == "all") {
+        p.res <- p + geom_linerange(aes_(ymin=~ymin, ymax=~ymax), color=color)
+        p.res <- p.res + geom_line(aes_(y = ~runningScore), color=color.line,
+                                   size=1)
+        enrichmentScore <- x@result[geneSetID, "enrichmentScore"]
+        es.df <- data.frame(es = which.min(abs(p$data$runningScore - enrichmentScore)))
+        p.res <- p.res + geom_vline(data = es.df, aes_(xintercept = ~es),
+                                    colour = color.vline, linetype = "dashed")
+        p.res <- p.res + ylab("Running Enrichment Score") + theme(axis.title =element_text(size=10), axis.text.x = element_text(size = 10), 
+                                                                  axis.text.y = element_text(size = 10))
+        p.res <- p.res + geom_hline(yintercept = 0)
+    }
+    if (by == "preranked" || by == "all") {
+        df2 <- data.frame(x = which(p$data$position == 1))
+        df2$y <- p$data$geneList[df2$x]
+        p.pos <- p + geom_segment(data=df2, aes_(x=~x, xend=~x, y=~y, yend=0),
+                                  color=color)
+        p.pos <- p.pos + ylab("Ranked List Metric") + theme(axis.title = element_text(size=10), axis.text.y = element_text(size = 10)) +
+            xlim(0, length(p$data$geneList))
+    }
+    if (by == "runningScore")
+        return(p.res + ggtitle(title))
+    if (by == "preranked")
+        return(p.pos + ggtitle(title))
+
+    p.pos <- p.pos + xlab(NULL) + theme(axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank())
+    p.pos <- p.pos + ggtitle(title) +
+        theme(plot.title=element_text(hjust=0.5, size=rel(2)))
+    plot_grid(p.pos, p.res, ncol=1, align="v")
+}
+
+```
+
+```{r fig.width=10, fig.height=15}
+sig_gsea_res <- gsea_res %>%
+  filter(p.adjust <= 0.05)
+
+## convert gsea results to data frame
+gsea_res_df <- as.data.frame(gsea_res)
+sig_gsea_res_df <- as.data.frame(sig_gsea_res)
+
+top5_pathways <- gsea_res_df %>%
+  slice_max(order_by = NES, n=5) %>% ## for bottom use -NES
+  pull(ID)
+
+top5_pathway_plots <- lapply(top5_pathways, function(pathway){plot_gsea(gsea_res, geneSetID = pathway) + labs(title = str_wrap(gsub("_", " ", str_remove(pathway, "GO_")), 40)) + xlab("test") + theme(plot.title = element_text(size=10, face = "bold"))})
+ggarrange(plotlist=top5_pathway_plots, ncol=2, nrow=3, labels = c("4A", "4B", "4C", "4D", "4E"))
+```
+
+There are `r nrow(sig_gsea_res_df)` significant results based on `p.adjust <= 0.05`:
+
+```{r}
+sig_gsea_res_df %>%
+  arrange(desc(NES)) %>%
+  select(NES, pvalue, p.adjust, core_enrichment) %>%
+  mutate(pvalue = format(pvalue, digits = 5, scientific = TRUE),
+         p.adjust = format(p.adjust, digits = 5, scientific = TRUE),
+         NES = signif(NES, 5)) %>%
+  datatable(options=list(scrollX = TRUE,
+                         scrollY = TRUE),
+            caption = 'Table 3: Enriched Pathways',
+            class = "nowrap display")
+```
+
+## Summary
+RNA-Seq counts from GBM cells with wildtype EGFR and GBM cells with EGFRvIII (mutant EGFR) were processed. Then, DEGs were calculated using DESeq2 and GSEA was carried out to determine enriched pathways. Many DEGs exist and many pathways were significantly enriched, indicating significant biological changes between the two genotypes. Results obtained from GSEA analysis also align with existing literature. 
+
+## References
+          
